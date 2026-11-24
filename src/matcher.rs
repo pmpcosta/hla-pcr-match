@@ -316,8 +316,8 @@ pub fn run_match(db: &AlleleDatabase, params: &MatchParams) -> Result<MatchResul
                             valid_orientation_max.map_or(length, |m| m.max(length)),
                         );
 
-                        let min_ok = min_size.map_or(true, |m| length >= m);
-                        let max_ok = max_size.map_or(true, |m| length <= m);
+                        let min_ok = min_size.is_none_or(|m| length >= m);
+                        let max_ok = max_size.is_none_or(|m| length <= m);
                         if min_ok && max_ok {
                             let fwd_template =
                                 String::from_utf8_lossy(&seq[fh.pos..fh.pos + fwd_len]).into_owned();

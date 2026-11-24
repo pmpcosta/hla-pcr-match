@@ -120,28 +120,29 @@ pub fn export_amplicons_fasta(
 
     let mut count = 0usize;
     for h in &results.hits {
-        if let Some(rec) = db.records.get(h.allele_index) {
-            if h.end <= rec.sequence.len() && h.start < h.end {
-                let amplicon = &rec.sequence[h.start..h.end];
-                writeln!(
-                    w,
-                    ">{} {} start={} end={} len={} fwd_mm={} rev_mm={}",
-                    h.allele,
-                    h.accession,
-                    h.start,
-                    h.end,
-                    h.length,
-                    h.fwd_mismatches,
-                    h.rev_mismatches
-                )
-                .map_err(|e| format!("Write error: {e}"))?;
+        if let Some(rec) = db.records.get(h.allele_index)
+            && h.end <= rec.sequence.len()
+            && h.start < h.end
+        {
+            let amplicon = &rec.sequence[h.start..h.end];
+            writeln!(
+                w,
+                ">{} {} start={} end={} len={} fwd_mm={} rev_mm={}",
+                h.allele,
+                h.accession,
+                h.start,
+                h.end,
+                h.length,
+                h.fwd_mismatches,
+                h.rev_mismatches
+            )
+            .map_err(|e| format!("Write error: {e}"))?;
 
-                for chunk in amplicon.chunks(80) {
-                    w.write_all(chunk).map_err(|e| format!("Write error: {e}"))?;
-                    writeln!(w).map_err(|e| format!("Write error: {e}"))?;
-                }
-                count += 1;
+            for chunk in amplicon.chunks(80) {
+                w.write_all(chunk).map_err(|e| format!("Write error: {e}"))?;
+                writeln!(w).map_err(|e| format!("Write error: {e}"))?;
             }
+            count += 1;
         }
     }
 

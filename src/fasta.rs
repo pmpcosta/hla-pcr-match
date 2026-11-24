@@ -92,12 +92,12 @@ impl AlleleDatabase {
                 continue;
             }
             if let Some(header_body) = trimmed.strip_prefix('>') {
-                if let Some(prev_header) = current_header.take() {
-                    if !current_seq.is_empty() {
-                        let rec = build_record(&prev_header, std::mem::take(&mut current_seq));
-                        loci_set.insert(rec.locus.clone());
-                        records.push(rec);
-                    }
+                if let Some(prev_header) = current_header.take()
+                    && !current_seq.is_empty()
+                {
+                    let rec = build_record(&prev_header, std::mem::take(&mut current_seq));
+                    loci_set.insert(rec.locus.clone());
+                    records.push(rec);
                 }
                 current_header = Some(header_body.to_string());
                 current_seq.clear();
@@ -110,12 +110,12 @@ impl AlleleDatabase {
             }
         }
 
-        if let Some(prev_header) = current_header {
-            if !current_seq.is_empty() {
-                let rec = build_record(&prev_header, current_seq);
-                loci_set.insert(rec.locus.clone());
-                records.push(rec);
-            }
+        if let Some(prev_header) = current_header
+            && !current_seq.is_empty()
+        {
+            let rec = build_record(&prev_header, current_seq);
+            loci_set.insert(rec.locus.clone());
+            records.push(rec);
         }
 
         if records.is_empty() {
@@ -135,13 +135,14 @@ fn build_record(header: &str, sequence: Vec<u8>) -> AlleleRecord {
     let first = parts.next().unwrap_or("");
     let second = parts.next();
 
-    let (accession, name) = if (first.starts_with("HLA:") || first.starts_with("IPD:"))
-        && second.is_some()
-    {
-        (first.to_string(), second.unwrap().to_string())
-    } else {
-        (String::new(), first.to_string())
-    };
+    let (accession, name) =
+        if (first.starts_with("HLA:") || first.starts_with("IPD:"))
+            && let Some(sec) = second
+        {
+            (first.to_string(), sec.to_string())
+        } else {
+            (String::new(), first.to_string())
+        };
 
     let locus = match name.split_once('*') {
         Some((loc, _)) => loc.to_string(),
@@ -183,10 +184,10 @@ impl QueryToken {
         if token_matches_record(&self.normalized, rec) {
             return true;
         }
-        if let Some(ref stripped) = self.stripped_hla {
-            if token_matches_record(stripped, rec) {
-                return true;
-            }
+        if let Some(ref stripped) = self.stripped_hla
+            && token_matches_record(stripped, rec)
+        {
+            return true;
         }
         false
     }
@@ -210,11 +211,11 @@ fn token_matches_record(token: &str, rec: &AlleleRecord) -> bool {
         if rec.name_upper == token {
             return true;
         }
-        if let Some(rest) = rec.name_upper.strip_prefix(token) {
-            if let Some(next_ch) = rest.chars().next() {
-                // Respect field boundaries (':') or expression suffixes (N, L, S, C, A, Q)
-                return next_ch == ':' || next_ch.is_ascii_alphabetic();
-            }
+        if let Some(rest) = rec.name_upper.strip_prefix(token)
+            && let Some(next_ch) = rest.chars().next()
+        {
+            // Respect field boundaries (':') or expression suffixes (N, L, S, C, A, Q)
+            return next_ch == ':' || next_ch.is_ascii_alphabetic();
         }
         false
     } else {
@@ -226,7 +227,7 @@ fn token_matches_record(token: &str, rec: &AlleleRecord) -> bool {
 /// Splits the query textarea by newlines, commas, or semicolons.
 pub fn parse_query_tokens(query: &str) -> Vec<QueryToken> {
     query
-        .split(|c| c == ',' || c == '\n' || c == '\r' || c == ';')
+        .split([',', '\n', '\r', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(QueryToken::from_raw)

@@ -552,13 +552,12 @@ impl HlaPrimerApp {
                     }
 
                     ui.add_enabled_ui(!self.is_busy(), |ui| {
-                        if ui.button("Open FASTA...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                        if ui.button("Open FASTA...").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("FASTA / ZIP", &["fasta", "fa", "fna", "zip"])
                                 .pick_file()
-                            {
-                                self.start_load_custom_fasta(path, ctx.clone());
-                            }
+                        {
+                            self.start_load_custom_fasta(path, ctx.clone());
                         }
 
                         ui.menu_button("Download IMGT/HLA ▾", |ui| {
@@ -925,13 +924,12 @@ impl HlaPrimerApp {
                             self.start_download(true, false, ctx.clone());
                         }
                         ui.add_space(4.0);
-                        if ui.button("Or Open a Local FASTA / ZIP File...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                        if ui.button("Or Open a Local FASTA / ZIP File...").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("FASTA / ZIP", &["fasta", "fa", "fna", "zip"])
                                 .pick_file()
-                            {
-                                self.start_load_custom_fasta(path, ctx.clone());
-                            }
+                        {
+                            self.start_load_custom_fasta(path, ctx.clone());
                         }
                     });
                 });
@@ -1382,17 +1380,15 @@ impl HlaPrimerApp {
                 if ui.small_button("Close").clicked() {
                     close_inspector = true;
                 }
-                if ui.small_button("Copy Amplicon DNA").clicked() {
-                    if let Some(db) = self.active_db() {
-                        if let Some(rec) = db.records.get(hit.allele_index) {
-                            if hit.end <= rec.sequence.len() && hit.start < hit.end {
-                                copy_seq = Some(
-                                    String::from_utf8_lossy(&rec.sequence[hit.start..hit.end])
-                                        .into_owned(),
-                                );
-                            }
-                        }
-                    }
+                if ui.small_button("Copy Amplicon DNA").clicked()
+                    && let Some(db) = self.active_db()
+                    && let Some(rec) = db.records.get(hit.allele_index)
+                    && hit.end <= rec.sequence.len()
+                    && hit.start < hit.end
+                {
+                    copy_seq = Some(
+                        String::from_utf8_lossy(&rec.sequence[hit.start..hit.end]).into_owned(),
+                    );
                 }
             });
         });
