@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+*.part
+imgt_hla_cache/
+.DS_Store
+Thumbs.db

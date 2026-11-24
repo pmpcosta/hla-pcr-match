@@ -1,0 +1,25 @@
+[package]
+name = "hla-pcr-match"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone GUI tool for in-silico HLA PCR primer matching modeled after IPD-MHC Primer Match"
+license = "Apache-2.0"
+repository = "https://github.com/pmpcosta/hla-pcr-match"
+readme = "README.md"
+keywords = ["hla", "pcr", "primer", "bioinformatics", "imgt"]
+categories = ["science", "gui"]
+
+[dependencies]
+eframe = "0.31"
+egui_extras = "0.31"
+rayon = "1.10"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+rfd = "0.15"
+directories = "6.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
