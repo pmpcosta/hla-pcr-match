@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use eframe::egui::{self, Color32, RichText, TextStyle};
@@ -15,9 +16,11 @@ use crate::download::{
 use crate::export::{
     export_amplicons_fasta, export_coverage_csv, export_hits_delimited, export_missed_csv,
 };
-use crate::fasta::AlleleDatabase;
-use crate::iupac::{bases_match, clean_and_validate_primer, encode_primer, primer_degeneracy, reverse_complement};
-use crate::matcher::{MatchParams, MatchResults, run_match};
+use crate::fasta::{AlleleDatabase, parse_query_tokens};
+use crate::iupac::{
+    bases_match, clean_and_validate_primer, encode_primer, primer_degeneracy, reverse_complement,
+};
+use crate::matcher::{MAX_AMPLICONS_PER_ALLELE, MatchParams, MatchResults, run_match};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -52,6 +55,46 @@ enum DataSourceMode {
     CustomFasta,
 }
 
+struct ThemeColors {
+    ok: Color32,
+    warn: Color32,
+    err: Color32,
+    err_bg: Color32,
+    info: Color32,
+    mm_zero: Color32,
+    mm_one: Color32,
+    mm_multi: Color32,
+    muted: Color32,
+}
+
+fn theme_colors(dark_mode: bool) -> ThemeColors {
+    if dark_mode {
+        ThemeColors {
+            ok: Color32::from_rgb(76, 195, 138),
+            warn: Color32::from_rgb(245, 179, 66),
+            err: Color32::from_rgb(255, 115, 115),
+            err_bg: Color32::from_rgba_unmultiplied(200, 50, 50, 35),
+            info: Color32::from_rgb(130, 180, 255),
+            mm_zero: Color32::from_rgb(76, 195, 138),
+            mm_one: Color32::from_rgb(245, 195, 70),
+            mm_multi: Color32::from_rgb(255, 130, 90),
+            muted: Color32::GRAY,
+        }
+    } else {
+        ThemeColors {
+            ok: Color32::from_rgb(18, 128, 72),
+            warn: Color32::from_rgb(168, 100, 0),
+            err: Color32::from_rgb(190, 34, 34),
+            err_bg: Color32::from_rgba_unmultiplied(210, 40, 40, 24),
+            info: Color32::from_rgb(22, 92, 185),
+            mm_zero: Color32::from_rgb(18, 128, 72),
+            mm_one: Color32::from_rgb(168, 100, 0),
+            mm_multi: Color32::from_rgb(196, 56, 20),
+            muted: Color32::from_rgb(100, 100, 100),
+        }
+    }
+}
+
 enum BgEvent {
     DownloadProgress(DownloadProgress),
     DownloadFinished(Result<ReleaseInfo, String>, bool, bool),
@@ -76,15 +119,18 @@ pub struct HlaPrimerApp {
 
     // Database state
     source_mode: DataSourceMode,
-    release_info: ReleaseInfo,
+    cds_release: ReleaseInfo,
+    genomic_release: ReleaseInfo,
     cds_db: Option<Arc<AlleleDatabase>>,
     genomic_db: Option<Arc<AlleleDatabase>>,
     custom_db: Option<Arc<AlleleDatabase>>,
     loading_db: bool,
 
-    // Background worker state
-    bg_rx: Option<Receiver<BgEvent>>,
+    // Background worker state (persistent channel avoids losing in-flight events)
+    bg_tx: Sender<BgEvent>,
+    bg_rx: Receiver<BgEvent>,
     download_progress: Option<DownloadProgress>,
+    download_cancel: Option<Arc<AtomicBool>>,
     matching_in_progress: bool,
 
     // Results & view state
@@ -97,6 +143,7 @@ pub struct HlaPrimerApp {
     miss_sort_col: MissSortCol,
     miss_sort_asc: bool,
     filtered_hit_indices: Vec<usize>,
+    filtered_coverage_indices: Vec<usize>,
     filtered_miss_indices: Vec<usize>,
     indices_dirty: bool,
 
@@ -111,7 +158,10 @@ impl HlaPrimerApp {
         let dark_mode = true;
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let release_info = read_cached_release_info();
+        let (bg_tx, bg_rx) = mpsc::channel();
+        let cds_release = read_cached_release_info(SequenceType::Cds);
+        let genomic_release = read_cached_release_info(SequenceType::Genomic);
+
         let mut app = Self {
             query: String::new(),
             primer_fwd: String::new(),
@@ -124,14 +174,17 @@ impl HlaPrimerApp {
             product_size_max: -1,
 
             source_mode: DataSourceMode::ImgtHla,
-            release_info,
+            cds_release,
+            genomic_release,
             cds_db: None,
             genomic_db: None,
             custom_db: None,
             loading_db: false,
 
-            bg_rx: None,
+            bg_tx,
+            bg_rx,
             download_progress: None,
+            download_cancel: None,
             matching_in_progress: false,
 
             results: None,
@@ -143,6 +196,7 @@ impl HlaPrimerApp {
             miss_sort_col: MissSortCol::Allele,
             miss_sort_asc: true,
             filtered_hit_indices: Vec::new(),
+            filtered_coverage_indices: Vec::new(),
             filtered_miss_indices: Vec::new(),
             indices_dirty: false,
 
@@ -176,11 +230,21 @@ impl HlaPrimerApp {
         }
     }
 
+    fn active_release_info(&self) -> &ReleaseInfo {
+        match self.seq_type {
+            SequenceType::Cds => &self.cds_release,
+            SequenceType::Genomic => &self.genomic_release,
+        }
+    }
+
     fn is_busy(&self) -> bool {
         self.loading_db || self.download_progress.is_some() || self.matching_in_progress
     }
 
     fn start_load_cached_db(&mut self, seq_type: SequenceType, ctx: egui::Context) {
+        if self.is_busy() {
+            return;
+        }
         let path = cached_fasta_path(seq_type);
         if !path.exists() {
             return;
@@ -189,8 +253,7 @@ impl HlaPrimerApp {
         self.error_msg = None;
         self.status_msg = Some(format!("Loading {}...", seq_type.label()));
 
-        let (tx, rx) = mpsc::channel();
-        self.bg_rx = Some(rx);
+        let tx = self.bg_tx.clone();
         let label = format!("IMGT/HLA {}", seq_type.label());
 
         thread::spawn(move || {
@@ -204,6 +267,9 @@ impl HlaPrimerApp {
     }
 
     fn start_load_custom_fasta(&mut self, path: PathBuf, ctx: egui::Context) {
+        if self.is_busy() {
+            return;
+        }
         self.loading_db = true;
         self.error_msg = None;
         let fname = path
@@ -213,8 +279,7 @@ impl HlaPrimerApp {
             .to_string();
         self.status_msg = Some(format!("Loading {fname}..."));
 
-        let (tx, rx) = mpsc::channel();
-        self.bg_rx = Some(rx);
+        let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
             let res = AlleleDatabase::load_from_path(&path, fname).map(Arc::new);
@@ -230,16 +295,17 @@ impl HlaPrimerApp {
         if self.is_busy() {
             return;
         }
+        let cancel = Arc::new(AtomicBool::new(false));
         self.error_msg = None;
         self.status_msg = None;
+        self.download_cancel = Some(Arc::clone(&cancel));
         self.download_progress = Some(DownloadProgress {
             stage: "Connecting to GitHub (ANHIG/IMGTHLA)...".to_string(),
             bytes_done: 0,
             bytes_total: None,
         });
 
-        let (tx, rx) = mpsc::channel();
-        self.bg_rx = Some(rx);
+        let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
             let (prog_tx, prog_rx) = mpsc::channel::<DownloadProgress>();
@@ -253,7 +319,7 @@ impl HlaPrimerApp {
                 }
             });
 
-            let result = download_imgt_hla(cds, genomic, &prog_tx);
+            let result = download_imgt_hla(cds, genomic, &prog_tx, &cancel);
             drop(prog_tx);
             let _ = forwarder.join();
             let _ = tx.send(BgEvent::DownloadFinished(result, cds, genomic));
@@ -288,11 +354,10 @@ impl HlaPrimerApp {
         self.error_msg = None;
         self.status_msg = Some("Running primer match...".to_string());
 
-        let (tx, rx) = mpsc::channel();
-        self.bg_rx = Some(rx);
+        let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
-            let res = run_match(&db, &params);
+            let res = run_match(db, &params);
             let _ = tx.send(BgEvent::MatchFinished(res));
             ctx.request_repaint();
         });
@@ -300,33 +365,25 @@ impl HlaPrimerApp {
 
     fn poll_background(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
-        let mut disconnected = false;
-        if let Some(ref rx) = self.bg_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(ev) => events.push(ev),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if disconnected {
-            self.bg_rx = None;
+        while let Ok(ev) = self.bg_rx.try_recv() {
+            events.push(ev);
         }
 
         for ev in events {
             match ev {
                 BgEvent::DownloadProgress(p) => {
-                    self.download_progress = Some(p);
+                    if self.download_progress.is_some() {
+                        self.download_progress = Some(p);
+                    }
                 }
                 BgEvent::DownloadFinished(res, downloaded_cds, downloaded_gen) => {
                     self.download_progress = None;
+                    self.download_cancel = None;
+                    // Refresh per-DB cached release info even on partial success
+                    self.cds_release = read_cached_release_info(SequenceType::Cds);
+                    self.genomic_release = read_cached_release_info(SequenceType::Genomic);
                     match res {
-                        Ok(info) => {
-                            self.release_info = info;
+                        Ok(_info) => {
                             self.source_mode = DataSourceMode::ImgtHla;
                             if downloaded_cds {
                                 self.cds_db = None;
@@ -350,7 +407,11 @@ impl HlaPrimerApp {
                             self.start_load_cached_db(to_load, ctx.clone());
                         }
                         Err(err) => {
-                            self.error_msg = Some(format!("Download failed: {err}"));
+                            if err == "Download cancelled." {
+                                self.status_msg = Some(err);
+                            } else {
+                                self.error_msg = Some(format!("Download failed: {err}"));
+                            }
                         }
                     }
                 }
@@ -413,6 +474,7 @@ impl HlaPrimerApp {
     fn rebuild_sorted_indices(&mut self) {
         let Some(ref res) = self.results else {
             self.filtered_hit_indices.clear();
+            self.filtered_coverage_indices.clear();
             self.filtered_miss_indices.clear();
             self.indices_dirty = false;
             return;
@@ -426,9 +488,9 @@ impl HlaPrimerApp {
             .enumerate()
             .filter(|(_, h)| {
                 needle.is_empty()
-                    || h.allele.to_ascii_lowercase().contains(&needle)
-                    || h.locus.to_ascii_lowercase().contains(&needle)
-                    || h.accession.to_ascii_lowercase().contains(&needle)
+                    || contains_ascii_ci(&h.allele, &needle)
+                    || contains_ascii_ci(&h.locus, &needle)
+                    || contains_ascii_ci(&h.accession, &needle)
             })
             .map(|(i, _)| i)
             .collect();
@@ -448,8 +510,17 @@ impl HlaPrimerApp {
                 HitSortCol::TotalMm => (ha.fwd_mismatches + ha.rev_mismatches)
                     .cmp(&(hb.fwd_mismatches + hb.rev_mismatches)),
             };
-            if asc { ord } else { ord.reverse() }
+            let ordered = if asc { ord } else { ord.reverse() };
+            ordered.then_with(|| ha.allele.cmp(&hb.allele))
         });
+
+        self.filtered_coverage_indices = res
+            .locus_coverage
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| needle.is_empty() || contains_ascii_ci(&c.locus, &needle))
+            .map(|(i, _)| i)
+            .collect();
 
         self.filtered_miss_indices = res
             .missed
@@ -457,9 +528,9 @@ impl HlaPrimerApp {
             .enumerate()
             .filter(|(_, m)| {
                 needle.is_empty()
-                    || m.allele.to_ascii_lowercase().contains(&needle)
-                    || m.locus.to_ascii_lowercase().contains(&needle)
-                    || m.reason.label().to_ascii_lowercase().contains(&needle)
+                    || contains_ascii_ci(&m.allele, &needle)
+                    || contains_ascii_ci(&m.locus, &needle)
+                    || contains_ascii_ci(&m.reason.label(), &needle)
             })
             .map(|(i, _)| i)
             .collect();
@@ -472,28 +543,36 @@ impl HlaPrimerApp {
             let ord = match mcol {
                 MissSortCol::Allele => ma.allele.cmp(&mb.allele),
                 MissSortCol::Locus => ma.locus.cmp(&mb.locus),
-                MissSortCol::Reason => ma.reason.label().cmp(&mb.reason.label()),
+                MissSortCol::Reason => ma.reason.sort_key().cmp(&mb.reason.sort_key()),
                 MissSortCol::FwdHits => ma.fwd_hits.cmp(&mb.fwd_hits),
                 MissSortCol::RevHits => ma.rev_hits.cmp(&mb.rev_hits),
             };
-            if masc { ord } else { ord.reverse() }
+            let ordered = if masc { ord } else { ord.reverse() };
+            ordered.then_with(|| ma.allele.cmp(&mb.allele))
         });
 
         self.indices_dirty = false;
     }
 
-    fn load_example(&mut self) {
+    fn load_example(&mut self, ctx: &egui::Context) {
         self.query = "HLA-A".to_string();
         // Real conserved HLA-A exon 1 -> exon 2 CDS primers from A*01:01:01:01
         self.primer_fwd = "ATGGCCGTCATGGCGCCCCG".to_string();
         self.primer_rvs = "CTGGTCCCAATACTCCGG".to_string();
-        self.seq_type = SequenceType::Cds;
         self.end_identity = 3;
         self.max_mismatch = 3;
         self.flip_reverse = true;
         self.product_size_min = -1;
         self.product_size_max = -1;
         self.error_msg = None;
+
+        if !self.is_busy() {
+            self.source_mode = DataSourceMode::ImgtHla;
+            self.seq_type = SequenceType::Cds;
+            if self.cds_db.is_none() && cached_fasta_path(SequenceType::Cds).exists() {
+                self.start_load_cached_db(SequenceType::Cds, ctx.clone());
+            }
+        }
     }
 
     fn reset_form(&mut self) {
@@ -509,6 +588,7 @@ impl HlaPrimerApp {
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context) {
+        let colors = theme_colors(self.dark_mode);
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -522,7 +602,7 @@ impl HlaPrimerApp {
                             "{} • {} alleles • {}",
                             self.seq_type.label(),
                             format_num(db.len()),
-                            self.release_info.display()
+                            self.active_release_info().display()
                         ),
                         DataSourceMode::CustomFasta => {
                             format!(
@@ -532,12 +612,9 @@ impl HlaPrimerApp {
                             )
                         }
                     };
-                    ui.colored_label(Color32::from_rgb(76, 195, 138), badge);
+                    ui.colored_label(colors.ok, badge);
                 } else {
-                    ui.colored_label(
-                        Color32::from_rgb(245, 179, 66),
-                        format!("{} not loaded", self.seq_type.label()),
-                    );
+                    ui.colored_label(colors.warn, format!("{} not loaded", self.seq_type.label()));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -584,9 +661,13 @@ impl HlaPrimerApp {
             // Progress bar during download or loading
             if let Some(ref prog) = self.download_progress {
                 ui.add_space(4.0);
-                let frac = prog
-                    .bytes_total
-                    .map(|t| if t > 0 { prog.bytes_done as f32 / t as f32 } else { 0.0 });
+                let frac = prog.bytes_total.map(|t| {
+                    if t > 0 {
+                        prog.bytes_done as f32 / t as f32
+                    } else {
+                        0.0
+                    }
+                });
                 let text = match prog.bytes_total {
                     Some(total) => format!(
                         "{} ({:.1} / {:.1} MB)",
@@ -596,13 +677,25 @@ impl HlaPrimerApp {
                     ),
                     None => prog.stage.clone(),
                 };
-                if let Some(f) = frac {
-                    ui.add(egui::ProgressBar::new(f).text(text).animate(true));
-                } else {
-                    ui.horizontal(|ui| {
+                let mut cancel_clicked = false;
+                ui.horizontal(|ui| {
+                    if let Some(f) = frac {
+                        ui.add(
+                            egui::ProgressBar::new(f)
+                                .desired_width((ui.available_width() - 74.0).max(120.0))
+                                .text(text)
+                                .animate(true),
+                        );
+                    } else {
                         ui.spinner();
                         ui.label(text);
-                    });
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+                if cancel_clicked && let Some(ref flag) = self.download_cancel {
+                    flag.store(true, Ordering::Relaxed);
                 }
             } else if self.loading_db || self.matching_in_progress {
                 ui.add_space(4.0);
@@ -616,6 +709,9 @@ impl HlaPrimerApp {
     }
 
     fn render_form_panel(&mut self, ctx: &egui::Context) {
+        let colors = theme_colors(self.dark_mode);
+        let busy = self.is_busy();
+
         egui::SidePanel::left("form_panel")
             .default_width(370.0)
             .min_width(310.0)
@@ -632,8 +728,8 @@ impl HlaPrimerApp {
                         ui.label(RichText::new("Specific sequences required").strong());
                         help_icon(
                             ui,
-                            "Choose specific loci or alleles separated by a comma or newline.\n\
-                             Examples: HLA-A, DRB1, B*07:02, A*01, MICA.\n\
+                            "Choose specific loci, alleles, or accessions separated by a comma or newline.\n\
+                             Examples: HLA-A, DRB1, B*07:02, A*01, MICA, HLA:HLA00001.\n\
                              Leave empty to search all alleles in the loaded database.",
                         );
                     });
@@ -655,11 +751,16 @@ impl HlaPrimerApp {
                         ui.label(RichText::new("Quick:").small().weak());
                         for loc in ["HLA-A", "HLA-B", "HLA-C", "DRB1", "DQB1", "DPB1"] {
                             if ui.small_button(loc).clicked() {
-                                if self.query.trim().is_empty() {
-                                    self.query = loc.to_string();
-                                } else {
-                                    self.query.push_str(", ");
-                                    self.query.push_str(loc);
+                                let already_present = parse_query_tokens(&self.query)
+                                    .iter()
+                                    .any(|t| t.raw.eq_ignore_ascii_case(loc));
+                                if !already_present {
+                                    if self.query.trim().is_empty() {
+                                        self.query = loc.to_string();
+                                    } else {
+                                        self.query.push_str(", ");
+                                        self.query.push_str(loc);
+                                    }
                                 }
                             }
                         }
@@ -675,7 +776,7 @@ impl HlaPrimerApp {
                         ui.label(RichText::new("Forward primer (5'→3'):").strong());
                         help_icon(
                             ui,
-                            "5'→3' sequence of the forward primer. IUPAC degenerate bases (R, Y, S, W, K, M, B, D, H, V, N) are supported.",
+                            "5'→3' sequence of the forward primer. IUPAC degenerate bases (R, Y, S, W, K, M, B, D, H, V, N) are supported; optional 5'- / -3' wrappers and spaces are stripped automatically.",
                         );
                     });
                     ui.add(
@@ -684,7 +785,7 @@ impl HlaPrimerApp {
                             .font(TextStyle::Monospace)
                             .hint_text("5'-ATGGCCGTCATGGCGCCCCG-3'"),
                     );
-                    render_primer_status(ui, &self.primer_fwd, false);
+                    render_primer_status(ui, &self.primer_fwd, false, &colors);
 
                     ui.add_space(8.0);
 
@@ -693,7 +794,7 @@ impl HlaPrimerApp {
                         ui.label(RichText::new("Reverse primer:").strong());
                         help_icon(
                             ui,
-                            "Sequence of the reverse primer (IUPAC degenerate bases supported).\n\
+                            "Sequence of the reverse primer (IUPAC degenerate bases supported; optional 5'- / -3' wrappers are stripped).\n\
                              When 'Flip reverse' is Yes (default), enter it in standard 5'→3' oligo order and it will be reverse-complemented automatically.",
                         );
                     });
@@ -703,7 +804,7 @@ impl HlaPrimerApp {
                             .font(TextStyle::Monospace)
                             .hint_text("5'-CTGGTCCCAATACTCCGG-3'"),
                     );
-                    render_primer_status(ui, &self.primer_rvs, self.flip_reverse);
+                    render_primer_status(ui, &self.primer_rvs, self.flip_reverse, &colors);
 
                     ui.add_space(10.0);
 
@@ -715,20 +816,22 @@ impl HlaPrimerApp {
                             "Select coding DNA (CDS: hla_nuc.fasta) or genomic DNA (Genomic: hla_gen.fasta including introns/UTRs).",
                         );
                         let prev_type = self.seq_type;
-                        egui::ComboBox::from_id_salt("seq_type_combo")
-                            .selected_text(self.seq_type.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.seq_type,
-                                    SequenceType::Cds,
-                                    SequenceType::Cds.label(),
-                                );
-                                ui.selectable_value(
-                                    &mut self.seq_type,
-                                    SequenceType::Genomic,
-                                    SequenceType::Genomic.label(),
-                                );
-                            });
+                        ui.add_enabled_ui(!busy, |ui| {
+                            egui::ComboBox::from_id_salt("seq_type_combo")
+                                .selected_text(self.seq_type.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.seq_type,
+                                        SequenceType::Cds,
+                                        SequenceType::Cds.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.seq_type,
+                                        SequenceType::Genomic,
+                                        SequenceType::Genomic.label(),
+                                    );
+                                });
+                        });
 
                         if self.seq_type != prev_type {
                             self.source_mode = DataSourceMode::ImgtHla;
@@ -744,11 +847,11 @@ impl HlaPrimerApp {
 
                     if self.source_mode == DataSourceMode::CustomFasta {
                         ui.horizontal(|ui| {
-                            ui.colored_label(
-                                Color32::from_rgb(130, 180, 255),
-                                "Using custom FASTA file.",
-                            );
-                            if ui.small_button("Switch to IMGT/HLA").clicked() {
+                            ui.colored_label(colors.info, "Using custom FASTA file.");
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Switch to IMGT/HLA").small())
+                                .clicked()
+                            {
                                 self.source_mode = DataSourceMode::ImgtHla;
                                 if self.active_db().is_none()
                                     && cached_fasta_path(self.seq_type).exists()
@@ -757,10 +860,10 @@ impl HlaPrimerApp {
                                 }
                             }
                         });
-                    } else if self.active_db().is_none() && !self.is_busy() {
+                    } else if self.active_db().is_none() && !busy {
                         ui.horizontal(|ui| {
                             ui.colored_label(
-                                Color32::from_rgb(245, 179, 66),
+                                colors.warn,
                                 format!("{} not cached locally.", self.seq_type.label()),
                             );
                             if ui.small_button("Download now").clicked() {
@@ -854,9 +957,9 @@ impl HlaPrimerApp {
 
                     ui.add_space(12.0);
 
-                    // Action buttons
-                    let ctrl_enter =
-                        ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+                    // Action buttons (Ctrl+Enter on Linux/Windows, Cmd+Enter on macOS)
+                    let cmd_enter =
+                        ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
                         let submit_btn = egui::Button::new(
                             RichText::new("  Submit  ").strong().color(Color32::WHITE),
@@ -864,8 +967,11 @@ impl HlaPrimerApp {
                         .fill(Color32::from_rgb(38, 128, 214))
                         .min_size(egui::vec2(110.0, 32.0));
 
-                        let clicked = ui.add_enabled(!self.is_busy(), submit_btn).clicked();
-                        if clicked || (ctrl_enter && !self.is_busy()) {
+                        let clicked = ui
+                            .add_enabled(!busy, submit_btn)
+                            .on_hover_text("Run primer match (Ctrl+Enter / Cmd+Enter)")
+                            .clicked();
+                        if clicked || (cmd_enter && !busy) {
                             self.start_match(ctx.clone());
                         }
 
@@ -873,7 +979,7 @@ impl HlaPrimerApp {
                             .add_sized([76.0, 32.0], egui::Button::new("Example"))
                             .clicked()
                         {
-                            self.load_example();
+                            self.load_example(ctx);
                         }
 
                         if ui
@@ -887,9 +993,9 @@ impl HlaPrimerApp {
                     if let Some(ref err) = self.error_msg {
                         ui.add_space(10.0);
                         egui::Frame::group(ui.style())
-                            .fill(Color32::from_rgba_unmultiplied(200, 50, 50, 35))
+                            .fill(colors.err_bg)
                             .show(ui, |ui| {
-                                ui.colored_label(Color32::from_rgb(255, 115, 115), err);
+                                ui.colored_label(colors.err, err);
                             });
                     }
                 });
@@ -897,6 +1003,8 @@ impl HlaPrimerApp {
     }
 
     fn render_results_panel(&mut self, ctx: &egui::Context) {
+        let colors = theme_colors(self.dark_mode);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // Welcome onboarding if no database is loaded and no results exist
             if self.active_db().is_none() && self.results.is_none() {
@@ -966,7 +1074,17 @@ impl HlaPrimerApp {
             }
 
             // Summary metrics & export bar
-            let (matched_u, total_s, hit_cnt, miss_cnt, locus_cnt, elapsed, unmatched_q) = {
+            let (
+                matched_u,
+                total_s,
+                hit_cnt,
+                miss_cnt,
+                locus_cnt,
+                elapsed,
+                unmatched_q,
+                truncated_hits,
+                source_label,
+            ) = {
                 let res = self.results.as_ref().unwrap();
                 (
                     res.matched_unique_alleles,
@@ -976,6 +1094,8 @@ impl HlaPrimerApp {
                     res.locus_coverage.len(),
                     res.elapsed_ms,
                     res.unmatched_queries.clone(),
+                    res.truncated_hits,
+                    res.db.source_label.clone(),
                 )
             };
             let cov_pct = if total_s > 0 {
@@ -995,11 +1115,11 @@ impl HlaPrimerApp {
                         ))
                         .strong()
                         .color(if cov_pct >= 90.0 {
-                            Color32::from_rgb(76, 195, 138)
+                            colors.ok
                         } else if cov_pct > 0.0 {
-                            Color32::from_rgb(245, 179, 66)
+                            colors.warn
                         } else {
-                            Color32::from_rgb(255, 115, 115)
+                            colors.err
                         }),
                     );
                     ui.separator();
@@ -1007,7 +1127,7 @@ impl HlaPrimerApp {
                     ui.separator();
                     ui.label(format!("Missed: {}", format_num(miss_cnt)));
                     ui.separator();
-                    ui.label(RichText::new(format!("{elapsed} ms")).weak());
+                    ui.label(RichText::new(format!("{source_label} • {elapsed} ms")).weak());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.menu_button("Export ▾", |ui| {
@@ -1038,10 +1158,20 @@ impl HlaPrimerApp {
                 if !unmatched_q.is_empty() {
                     ui.add_space(4.0);
                     ui.colored_label(
-                        Color32::from_rgb(245, 179, 66),
+                        colors.warn,
                         format!(
                             "Warning — unrecognized query term(s): {}",
                             unmatched_q.join(", ")
+                        ),
+                    );
+                }
+
+                if truncated_hits {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        colors.warn,
+                        format!(
+                            "Warning — one or more alleles exceeded the per-allele limit ({MAX_AMPLICONS_PER_ALLELE} amplicons) and were truncated. Tighten primer specificity or Product Size bounds."
                         ),
                     );
                 }
@@ -1098,7 +1228,7 @@ impl HlaPrimerApp {
                 egui::vec2(ui.available_width(), table_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| match self.active_tab {
-                    ActiveTab::Matches => self.render_matches_table(ui),
+                    ActiveTab::Matches => self.render_matches_table(ui, &colors),
                     ActiveTab::Coverage => self.render_coverage_table(ui),
                     ActiveTab::Missed => self.render_missed_table(ui),
                 },
@@ -1106,12 +1236,12 @@ impl HlaPrimerApp {
 
             if show_inspector {
                 ui.separator();
-                self.render_alignment_inspector(ui);
+                self.render_alignment_inspector(ui, &colors);
             }
         });
     }
 
-    fn render_matches_table(&mut self, ui: &mut egui::Ui) {
+    fn render_matches_table(&mut self, ui: &mut egui::Ui, colors: &ThemeColors) {
         let Some(ref res) = self.results else {
             return;
         };
@@ -1140,25 +1270,34 @@ impl HlaPrimerApp {
             .column(Column::remainder().at_least(140.0)) // Binding sites preview
             .header(22.0, |mut header| {
                 let cols = [
-                    ("Allele", HitSortCol::Allele),
-                    ("Start", HitSortCol::Start),
-                    ("End", HitSortCol::End),
-                    ("Length", HitSortCol::Length),
-                    ("Fwd MM", HitSortCol::FwdMm),
-                    ("Rev MM", HitSortCol::RevMm),
-                    ("Total MM", HitSortCol::TotalMm),
+                    ("Allele", HitSortCol::Allele, None),
+                    (
+                        "Start",
+                        HitSortCol::Start,
+                        Some("0-based inclusive start coordinate"),
+                    ),
+                    (
+                        "End",
+                        HitSortCol::End,
+                        Some("0-based exclusive end coordinate"),
+                    ),
+                    ("Length", HitSortCol::Length, Some("Amplicon length in bp")),
+                    ("Fwd MM", HitSortCol::FwdMm, None),
+                    ("Rev MM", HitSortCol::RevMm, None),
+                    ("Total MM", HitSortCol::TotalMm, None),
                 ];
-                for (title, col) in cols {
+                for (title, col, tip) in cols {
                     header.col(|ui| {
                         let arrow = if self.hit_sort_col == col {
                             if self.hit_sort_asc { " ▲" } else { " ▼" }
                         } else {
                             ""
                         };
-                        if ui
-                            .button(RichText::new(format!("{title}{arrow}")).strong())
-                            .clicked()
-                        {
+                        let mut resp = ui.button(RichText::new(format!("{title}{arrow}")).strong());
+                        if let Some(t) = tip {
+                            resp = resp.on_hover_text(t);
+                        }
+                        if resp.clicked() {
                             sort_change = Some(col);
                         }
                     });
@@ -1189,13 +1328,13 @@ impl HlaPrimerApp {
                         ui.label(hit.length.to_string());
                     });
                     row.col(|ui| {
-                        mm_badge(ui, hit.fwd_mismatches);
+                        mm_badge(ui, hit.fwd_mismatches, colors);
                     });
                     row.col(|ui| {
-                        mm_badge(ui, hit.rev_mismatches);
+                        mm_badge(ui, hit.rev_mismatches, colors);
                     });
                     row.col(|ui| {
-                        mm_badge(ui, hit.fwd_mismatches + hit.rev_mismatches);
+                        mm_badge(ui, hit.fwd_mismatches + hit.rev_mismatches, colors);
                     });
                     row.col(|ui| {
                         ui.monospace(format!("{} … {}", hit.fwd_template, hit.rev_template));
@@ -1225,12 +1364,6 @@ impl HlaPrimerApp {
         let Some(ref res) = self.results else {
             return;
         };
-        let needle = self.filter_text.trim().to_ascii_lowercase();
-        let rows: Vec<_> = res
-            .locus_coverage
-            .iter()
-            .filter(|c| needle.is_empty() || c.locus.to_ascii_lowercase().contains(&needle))
-            .collect();
 
         TableBuilder::new(ui)
             .striped(true)
@@ -1249,8 +1382,9 @@ impl HlaPrimerApp {
                 }
             })
             .body(|body| {
-                body.rows(22.0, rows.len(), |mut row| {
-                    let c = rows[row.index()];
+                let count = self.filtered_coverage_indices.len();
+                body.rows(22.0, count, |mut row| {
+                    let c = &res.locus_coverage[self.filtered_coverage_indices[row.index()]];
                     row.col(|ui| {
                         ui.monospace(&c.locus);
                     });
@@ -1351,7 +1485,7 @@ impl HlaPrimerApp {
         }
     }
 
-    fn render_alignment_inspector(&mut self, ui: &mut egui::Ui) {
+    fn render_alignment_inspector(&mut self, ui: &mut egui::Ui, colors: &ThemeColors) {
         let Some(hit_idx) = self.selected_hit_idx else {
             return;
         };
@@ -1381,8 +1515,7 @@ impl HlaPrimerApp {
                     close_inspector = true;
                 }
                 if ui.small_button("Copy Amplicon DNA").clicked()
-                    && let Some(db) = self.active_db()
-                    && let Some(rec) = db.records.get(hit.allele_index)
+                    && let Some(rec) = res.db.records.get(hit.allele_index)
                     && hit.end <= rec.sequence.len()
                     && hit.start < hit.end
                 {
@@ -1394,7 +1527,7 @@ impl HlaPrimerApp {
         });
 
         ui.add_space(4.0);
-        egui::ScrollArea::horizontal().show(ui, |ui| {
+        egui::ScrollArea::both().show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Forward alignment block
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1411,6 +1544,7 @@ impl HlaPrimerApp {
                         &hit.fwd_template,
                         res.end_identity_used,
                         true,
+                        colors,
                     );
                 });
 
@@ -1431,6 +1565,7 @@ impl HlaPrimerApp {
                         &hit.rev_template,
                         res.end_identity_used,
                         false,
+                        colors,
                     );
                 });
             });
@@ -1501,15 +1636,13 @@ impl HlaPrimerApp {
     }
 
     fn do_export_fasta(&mut self) {
-        let (Some(res), Some(db)) = (&self.results, self.active_db()) else {
-            return;
-        };
+        let Some(ref res) = self.results else { return };
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name("hla_pcr_amplicons.fasta")
             .add_filter("FASTA", &["fasta", "fa"])
             .save_file()
         {
-            match export_amplicons_fasta(&path, db, res) {
+            match export_amplicons_fasta(&path, res) {
                 Ok(n) => {
                     self.status_msg = Some(format!(
                         "Exported {n} amplicon sequences to {}",
@@ -1526,9 +1659,8 @@ impl eframe::App for HlaPrimerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
         self.render_top_bar(ctx);
-        self.render_form_panel(ctx);
-        self.render_results_panel(ctx);
 
+        // TopBottomPanel must be added before SidePanel / CentralPanel in egui.
         if let Some(ref msg) = self.status_msg {
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1536,6 +1668,9 @@ impl eframe::App for HlaPrimerApp {
                 });
             });
         }
+
+        self.render_form_panel(ctx);
+        self.render_results_panel(ctx);
     }
 }
 
@@ -1544,7 +1679,7 @@ fn help_icon(ui: &mut egui::Ui, tooltip: &str) {
         .on_hover_text(tooltip);
 }
 
-fn render_primer_status(ui: &mut egui::Ui, raw: &str, show_rc: bool) {
+fn render_primer_status(ui: &mut egui::Ui, raw: &str, show_rc: bool, colors: &ThemeColors) {
     if raw.trim().is_empty() {
         return;
     }
@@ -1559,16 +1694,16 @@ fn render_primer_status(ui: &mut egui::Ui, raw: &str, show_rc: bool) {
             ui.label(RichText::new(info).small().monospace().weak());
         }
         Err(err) => {
-            ui.colored_label(Color32::from_rgb(255, 115, 115), RichText::new(err).small());
+            ui.colored_label(colors.err, RichText::new(err).small());
         }
     }
 }
 
-fn mm_badge(ui: &mut egui::Ui, mm: usize) {
+fn mm_badge(ui: &mut egui::Ui, mm: usize, colors: &ThemeColors) {
     let color = match mm {
-        0 => Color32::from_rgb(76, 195, 138),
-        1 => Color32::from_rgb(245, 195, 70),
-        _ => Color32::from_rgb(255, 130, 90),
+        0 => colors.mm_zero,
+        1 => colors.mm_one,
+        _ => colors.mm_multi,
     };
     ui.colored_label(color, RichText::new(mm.to_string()).strong());
 }
@@ -1579,6 +1714,7 @@ fn render_colored_alignment(
     template: &str,
     end_identity: usize,
     is_forward: bool,
+    colors: &ThemeColors,
 ) {
     let p_masks = encode_primer(primer);
     let p_bytes = primer.as_bytes();
@@ -1586,27 +1722,33 @@ fn render_colored_alignment(
     let len = p_bytes.len().min(t_bytes.len());
     let ei = end_identity.min(len);
 
-    let in_end_id = |i: usize| -> bool {
-        if is_forward {
-            i >= len - ei
-        } else {
-            i < ei
-        }
-    };
+    let in_end_id = |i: usize| -> bool { if is_forward { i >= len - ei } else { i < ei } };
 
-    let green = Color32::from_rgb(76, 195, 138);
-    let red = Color32::from_rgb(255, 95, 95);
+    let green = colors.ok;
+    let red = colors.err;
     let normal = ui.visuals().text_color();
-    let muted = Color32::GRAY;
+    let muted = colors.muted;
     let font = egui::FontId::monospace(13.0);
 
     let mut primer_job = egui::text::LayoutJob::default();
     let mut mid_job = egui::text::LayoutJob::default();
     let mut tmpl_job = egui::text::LayoutJob::default();
 
-    primer_job.append("Primer:   ", 0.0, egui::TextFormat::simple(font.clone(), muted));
-    mid_job.append("          ", 0.0, egui::TextFormat::simple(font.clone(), muted));
-    tmpl_job.append("Template: ", 0.0, egui::TextFormat::simple(font.clone(), muted));
+    primer_job.append(
+        "Primer:   ",
+        0.0,
+        egui::TextFormat::simple(font.clone(), muted),
+    );
+    mid_job.append(
+        "          ",
+        0.0,
+        egui::TextFormat::simple(font.clone(), muted),
+    );
+    tmpl_job.append(
+        "Template: ",
+        0.0,
+        egui::TextFormat::simple(font.clone(), muted),
+    );
 
     for i in 0..len {
         let matched = bases_match(t_bytes[i], p_masks[i]);
@@ -1635,6 +1777,22 @@ fn render_colored_alignment(
     ui.label(primer_job);
     ui.label(mid_job);
     ui.label(tmpl_job);
+}
+
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(&hb, &nb)| hb.to_ascii_lowercase() == nb)
+    })
 }
 
 fn format_num(n: usize) -> String {

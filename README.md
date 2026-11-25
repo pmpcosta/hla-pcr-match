@@ -8,11 +8,11 @@ A fast, standalone Rust desktop GUI for **in-silico PCR primer matching** agains
 ## Features
 
 - **Exact IPD-MHC Primer Match form & semantics:**
-  - **Specific sequences required** — comma- or newline-separated loci/alleles (e.g. `HLA-A`, `A`, `DRB1*15:01`, `B*07`, `MICA`), or leave empty to search all loci
-  - **Forward primer (5'→3') & Reverse primer** — full IUPAC degeneracy codes (`R, Y, S, W, K, M, B, D, H, V, N`), live length/degeneracy readout, and live reverse-complement preview
+  - **Specific sequences required** — comma- or newline-separated loci, alleles, or accessions (e.g. `HLA-A`, `A`, `DRB1*15:01`, `B*07`, `MICA`, `HLA:HLA00001`), or leave empty to search all loci
+  - **Forward primer (5'→3') & Reverse primer** — full IUPAC degeneracy codes (`R, Y, S, W, K, M, B, D, H, V, N`), automatic stripping of optional `5'-` / `-3'` wrappers, live length/degeneracy readout, and live reverse-complement preview
   - **Type** — switch between `CDS database` (`hla_nuc.fasta`) and `Genomic database` (`hla_gen.fasta`, including introns & UTRs)
   - **Options** — `End Identity` (strict 3'-end exact match, default `3`), `Max mismatches` (default `3`), and `Flip reverse` (`Yes`/`No`, default `Yes`)
-  - **Product Size** — `Min` / `Max` amplicon size bounds (`-1` = unbounded)
+  - **Product Size** — `Min` / `Max` amplicon size bounds (`-1` = unbounded); reported `Start`/`End` coordinates are 0-based half-open (`start..end`)
 - **One-click IMGT/HLA Downloader & Local Cache:**
   - Downloads `release_version.txt`, `hla_nuc.fasta`, and `hla_gen.fasta.zip` directly from [ANHIG/IMGTHLA](https://github.com/ANHIG/IMGTHLA) and caches them locally for offline use.
   - Also supports loading any local `.fasta`, `.fa`, `.fna`, or `.zip` file.
