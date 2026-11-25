@@ -9,6 +9,8 @@ use std::path::Path;
 pub struct AlleleRecord {
     /// Accession ID if present (e.g. "HLA:HLA00001")
     pub accession: String,
+    /// Uppercase accession cached for fast case-insensitive filtering
+    pub accession_upper: String,
     /// Allele name (e.g. "A*01:01:01:01", "MICA*001:01:01", "Mamu-A1*001:01")
     pub name: String,
     /// Uppercase allele name cached for fast case-insensitive filtering
@@ -26,6 +28,21 @@ pub struct AlleleDatabase {
     pub source_label: String,
     pub records: Vec<AlleleRecord>,
     pub loci: Vec<String>,
+}
+
+/// Returns true if a ZIP archive entry is a real FASTA file (not a directory or macOS metadata).
+pub(crate) fn is_fasta_zip_entry(entry_name: &str, is_dir: bool) -> bool {
+    if is_dir {
+        return false;
+    }
+    if entry_name
+        .split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case("__MACOSX") || part.starts_with("._"))
+    {
+        return false;
+    }
+    let lower = entry_name.to_ascii_lowercase();
+    lower.ends_with(".fasta") || lower.ends_with(".fa") || lower.ends_with(".fna")
 }
 
 impl AlleleDatabase {
@@ -54,9 +71,8 @@ impl AlleleDatabase {
                 let entry = archive
                     .by_index(i)
                     .map_err(|e| format!("Failed to read zip entry {i}: {e}"))?;
-                let name = entry.name().to_ascii_lowercase();
-                if name.ends_with(".fasta") || name.ends_with(".fa") || name.ends_with(".fna") {
-                    return Self::parse_reader(BufReader::new(entry), label);
+                if is_fasta_zip_entry(entry.name(), entry.is_dir()) {
+                    return Self::parse_reader(BufReader::with_capacity(256 * 1024, entry), label);
                 }
             }
             Err(format!(
@@ -75,7 +91,7 @@ impl AlleleDatabase {
         let mut loci_set = BTreeSet::new();
 
         let mut current_header: Option<String> = None;
-        let mut current_seq: Vec<u8> = Vec::with_capacity(4096);
+        let mut current_seq: Vec<u8> = Vec::with_capacity(1024);
 
         let mut line = String::new();
         let mut reader = reader;
@@ -130,30 +146,33 @@ impl AlleleDatabase {
     }
 }
 
-fn build_record(header: &str, sequence: Vec<u8>) -> AlleleRecord {
+fn build_record(header: &str, mut sequence: Vec<u8>) -> AlleleRecord {
+    sequence.shrink_to_fit();
+
     let mut parts = header.split_whitespace();
     let first = parts.next().unwrap_or("");
     let second = parts.next();
 
-    let (accession, name) =
-        if (first.starts_with("HLA:") || first.starts_with("IPD:"))
-            && let Some(sec) = second
-        {
-            (first.to_string(), sec.to_string())
-        } else {
-            (String::new(), first.to_string())
-        };
+    let (accession, name) = if (first.starts_with("HLA:") || first.starts_with("IPD:"))
+        && let Some(sec) = second
+    {
+        (first.to_string(), sec.to_string())
+    } else {
+        (String::new(), first.to_string())
+    };
 
     let locus = match name.split_once('*') {
         Some((loc, _)) => loc.to_string(),
         None => name.clone(),
     };
 
+    let accession_upper = accession.to_ascii_uppercase();
     let name_upper = name.to_ascii_uppercase();
     let locus_upper = locus.to_ascii_uppercase();
 
     AlleleRecord {
         accession,
+        accession_upper,
         name,
         name_upper,
         locus,
@@ -198,7 +217,7 @@ fn token_matches_record(token: &str, rec: &AlleleRecord) -> bool {
         return false;
     }
 
-    // e.g. "A*" or "DRB1*" -> match entire locus
+    // e.g. "A*" or "DRB1*" -> match entire locus; "A*01*" -> prefix wildcard
     if let Some(loc_only) = token.strip_suffix('*') {
         if !loc_only.contains('*') {
             return rec.locus_upper == loc_only;
@@ -207,9 +226,12 @@ fn token_matches_record(token: &str, rec: &AlleleRecord) -> bool {
     }
 
     if token.contains('*') {
-        // Specific allele or allele-group prefix (e.g. "A*02", "A*02:01", "A*02:01:01:01")
+        // Specific allele or allele-group prefix (e.g. "A*02", "A*02:", "A*02:01", "A*02:01:01:01")
         if rec.name_upper == token {
             return true;
+        }
+        if token.ends_with(':') {
+            return rec.name_upper.starts_with(token);
         }
         if let Some(rest) = rec.name_upper.strip_prefix(token)
             && let Some(next_ch) = rest.chars().next()
@@ -220,7 +242,13 @@ fn token_matches_record(token: &str, rec: &AlleleRecord) -> bool {
         false
     } else {
         // Locus-only query (e.g. "A", "DRB1", "MICA", "Mamu-A1") or accession match
-        rec.locus_upper == token || rec.name_upper == token
+        let acc_match = !rec.accession_upper.is_empty()
+            && (rec.accession_upper == token
+                || rec
+                    .accession_upper
+                    .split_once(':')
+                    .is_some_and(|(_, id)| id == token));
+        rec.locus_upper == token || rec.name_upper == token || acc_match
     }
 }
 
@@ -304,6 +332,16 @@ ATGGGGCTGGGCCCGGTCTT
         assert_eq!(ids, vec![0, 1]);
         assert!(unmatched.is_empty());
 
+        // Trailing colon matches allele group cleanly
+        let (ids, unmatched) = filter_alleles(&db, "A*01:");
+        assert_eq!(ids, vec![0, 1]);
+        assert!(unmatched.is_empty());
+
+        // Accession matching (full or stripped prefix)
+        let (ids, unmatched) = filter_alleles(&db, "HLA:HLA00001, hla00100");
+        assert_eq!(ids, vec![0, 3]);
+        assert!(unmatched.is_empty());
+
         // Multi-token + case insensitive + unmatched reporting
         let (ids, unmatched) = filter_alleles(&db, "hla-b*07:02, mica\nHLA-Z99");
         assert_eq!(ids, vec![3, 4]);
@@ -313,5 +351,16 @@ ATGGGGCTGGGCCCGGTCTT
         let (ids, unmatched) = filter_alleles(&db, "   ");
         assert_eq!(ids.len(), 5);
         assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn test_is_fasta_zip_entry() {
+        assert!(is_fasta_zip_entry("hla_gen.fasta", false));
+        assert!(is_fasta_zip_entry("sub/custom.FA", false));
+        assert!(is_fasta_zip_entry("sequences.fna", false));
+        assert!(!is_fasta_zip_entry("dir.fasta/", true));
+        assert!(!is_fasta_zip_entry("__MACOSX/._hla_gen.fasta", false));
+        assert!(!is_fasta_zip_entry("folder/._custom.fa", false));
+        assert!(!is_fasta_zip_entry("README.txt", false));
     }
 }
