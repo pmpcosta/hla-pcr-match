@@ -1303,6 +1303,11 @@ impl HlaPrimerApp {
             return;
         };
 
+        if !ui.ctx().wants_keyboard_input() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.selected_hit_idx = None;
+        }
+
         if self.filtered_hit_indices.is_empty() {
             ui.add_space(20.0);
             ui.label("No matching amplicons.");
@@ -1315,13 +1320,9 @@ impl HlaPrimerApp {
         let rev_masks = encode_primer(&res.rev_motif_used);
 
         const ROW_HEIGHT: f32 = 20.0;
+        let row_stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
         let mut scroll_to_row: Option<usize> = None;
         let mut scroll_offset: Option<f32> = None;
-
-        if !ui.ctx().wants_keyboard_input() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            self.selected_hit_idx = None;
-        }
 
         if let Some(key) = read_scroll_key(ui.ctx()) {
             let row_count = self.filtered_hit_indices.len();
@@ -1331,7 +1332,7 @@ impl HlaPrimerApp {
 
             if let Some(cur_row) = cur_selected_row {
                 let page_rows = if self.matches_scroll.viewport_h > 0.0 {
-                    ((self.matches_scroll.viewport_h / ROW_HEIGHT).floor() as usize)
+                    ((self.matches_scroll.viewport_h / row_stride).floor() as usize)
                         .saturating_sub(1)
                         .max(1)
                 } else {
@@ -1348,7 +1349,7 @@ impl HlaPrimerApp {
                 self.selected_hit_idx = Some(self.filtered_hit_indices[next_row]);
                 scroll_to_row = Some(next_row);
             } else {
-                scroll_offset = Some(next_scroll_offset(self.matches_scroll, ROW_HEIGHT, key));
+                scroll_offset = Some(next_scroll_offset(self.matches_scroll, row_stride, key));
             }
         }
 
@@ -1472,8 +1473,9 @@ impl HlaPrimerApp {
         };
 
         const ROW_HEIGHT: f32 = 22.0;
+        let row_stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
         let scroll_offset = read_scroll_key(ui.ctx())
-            .map(|key| next_scroll_offset(self.coverage_scroll, ROW_HEIGHT, key));
+            .map(|key| next_scroll_offset(self.coverage_scroll, row_stride, key));
 
         let mut builder = TableBuilder::new(ui)
             .id_salt("coverage_table")
@@ -1541,8 +1543,9 @@ impl HlaPrimerApp {
         }
 
         const ROW_HEIGHT: f32 = 20.0;
+        let row_stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
         let scroll_offset = read_scroll_key(ui.ctx())
-            .map(|key| next_scroll_offset(self.missed_scroll, ROW_HEIGHT, key));
+            .map(|key| next_scroll_offset(self.missed_scroll, row_stride, key));
 
         let mut sort_change: Option<MissSortCol> = None;
 
@@ -1667,7 +1670,7 @@ impl HlaPrimerApp {
         });
 
         ui.add_space(4.0);
-        egui::ScrollArea::horizontal()
+        egui::ScrollArea::both()
             .id_salt("alignment_inspector_scroll")
             .show(ui, |ui| {
                 ui.vertical(|ui| {
