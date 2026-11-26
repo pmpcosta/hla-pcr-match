@@ -20,7 +20,7 @@ use crate::fasta::{AlleleDatabase, parse_query_tokens};
 use crate::iupac::{
     bases_match, clean_and_validate_primer, encode_primer, primer_degeneracy, reverse_complement,
 };
-use crate::matcher::{MAX_AMPLICONS_PER_ALLELE, MatchParams, MatchResults, run_match};
+use crate::matcher::{AmpliconHit, MAX_AMPLICONS_PER_ALLELE, MatchParams, MatchResults, run_match};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -35,8 +35,6 @@ enum HitSortCol {
     Start,
     End,
     Length,
-    FwdMm,
-    RevMm,
     TotalMm,
 }
 
@@ -55,6 +53,23 @@ enum DataSourceMode {
     CustomFasta,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct TableScrollState {
+    offset_y: f32,
+    viewport_h: f32,
+    content_h: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollKey {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
 struct ThemeColors {
     ok: Color32,
     warn: Color32,
@@ -64,6 +79,12 @@ struct ThemeColors {
     mm_zero: Color32,
     mm_one: Color32,
     mm_multi: Color32,
+    /// (background, foreground) for mismatched bases in a site with 1 mismatch
+    site_mm1: (Color32, Color32),
+    /// (background, foreground) for mismatched bases in a site with 2 mismatches
+    site_mm2: (Color32, Color32),
+    /// (background, foreground) for mismatched bases in a site with 3+ mismatches
+    site_mm3_plus: (Color32, Color32),
     muted: Color32,
 }
 
@@ -78,6 +99,18 @@ fn theme_colors(dark_mode: bool) -> ThemeColors {
             mm_zero: Color32::from_rgb(76, 195, 138),
             mm_one: Color32::from_rgb(245, 195, 70),
             mm_multi: Color32::from_rgb(255, 130, 90),
+            site_mm1: (
+                Color32::from_rgb(38, 96, 62),
+                Color32::from_rgb(220, 252, 231),
+            ),
+            site_mm2: (
+                Color32::from_rgb(120, 92, 22),
+                Color32::from_rgb(254, 249, 195),
+            ),
+            site_mm3_plus: (
+                Color32::from_rgb(138, 42, 42),
+                Color32::from_rgb(254, 226, 226),
+            ),
             muted: Color32::GRAY,
         }
     } else {
@@ -90,6 +123,18 @@ fn theme_colors(dark_mode: bool) -> ThemeColors {
             mm_zero: Color32::from_rgb(18, 128, 72),
             mm_one: Color32::from_rgb(168, 100, 0),
             mm_multi: Color32::from_rgb(196, 56, 20),
+            site_mm1: (
+                Color32::from_rgb(187, 247, 208),
+                Color32::from_rgb(20, 83, 45),
+            ),
+            site_mm2: (
+                Color32::from_rgb(254, 240, 138),
+                Color32::from_rgb(113, 63, 18),
+            ),
+            site_mm3_plus: (
+                Color32::from_rgb(254, 202, 202),
+                Color32::from_rgb(127, 29, 29),
+            ),
             muted: Color32::from_rgb(100, 100, 100),
         }
     }
@@ -146,6 +191,9 @@ pub struct HlaPrimerApp {
     filtered_coverage_indices: Vec<usize>,
     filtered_miss_indices: Vec<usize>,
     indices_dirty: bool,
+    matches_scroll: TableScrollState,
+    coverage_scroll: TableScrollState,
+    missed_scroll: TableScrollState,
 
     // Feedback banners
     error_msg: Option<String>,
@@ -199,6 +247,9 @@ impl HlaPrimerApp {
             filtered_coverage_indices: Vec::new(),
             filtered_miss_indices: Vec::new(),
             indices_dirty: false,
+            matches_scroll: TableScrollState::default(),
+            coverage_scroll: TableScrollState::default(),
+            missed_scroll: TableScrollState::default(),
 
             error_msg: None,
             status_msg: None,
@@ -354,6 +405,13 @@ impl HlaPrimerApp {
         self.error_msg = None;
         self.status_msg = Some("Running primer match...".to_string());
 
+        // Release focus from any TextEdit so arrow / PageUp / PageDown keys scroll results directly.
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
@@ -505,8 +563,6 @@ impl HlaPrimerApp {
                 HitSortCol::Start => ha.start.cmp(&hb.start),
                 HitSortCol::End => ha.end.cmp(&hb.end),
                 HitSortCol::Length => ha.length.cmp(&hb.length),
-                HitSortCol::FwdMm => ha.fwd_mismatches.cmp(&hb.fwd_mismatches),
-                HitSortCol::RevMm => ha.rev_mismatches.cmp(&hb.rev_mismatches),
                 HitSortCol::TotalMm => (ha.fwd_mismatches + ha.rev_mismatches)
                     .cmp(&(hb.fwd_mismatches + hb.rev_mismatches)),
             };
@@ -1204,6 +1260,7 @@ impl HlaPrimerApp {
                     }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.filter_text)
+                            .id(egui::Id::new("results_filter_input"))
                             .desired_width(210.0)
                             .hint_text("Filter allele / locus..."),
                     );
@@ -1219,7 +1276,7 @@ impl HlaPrimerApp {
             let show_inspector =
                 self.active_tab == ActiveTab::Matches && self.selected_hit_idx.is_some();
             let table_height = if show_inspector {
-                (ui.available_height() - 170.0).max(160.0)
+                (ui.available_height() - 195.0).max(160.0)
             } else {
                 ui.available_height().max(160.0)
             };
@@ -1254,8 +1311,49 @@ impl HlaPrimerApp {
 
         let mut sort_change: Option<HitSortCol> = None;
         let mut newly_selected: Option<usize> = None;
+        let fwd_masks = encode_primer(&res.fwd_primer_used);
+        let rev_masks = encode_primer(&res.rev_motif_used);
 
-        TableBuilder::new(ui)
+        const ROW_HEIGHT: f32 = 20.0;
+        let mut scroll_to_row: Option<usize> = None;
+        let mut scroll_offset: Option<f32> = None;
+
+        if !ui.ctx().wants_keyboard_input() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.selected_hit_idx = None;
+        }
+
+        if let Some(key) = read_scroll_key(ui.ctx()) {
+            let row_count = self.filtered_hit_indices.len();
+            let cur_selected_row = self
+                .selected_hit_idx
+                .and_then(|sel| self.filtered_hit_indices.iter().position(|&idx| idx == sel));
+
+            if let Some(cur_row) = cur_selected_row {
+                let page_rows = if self.matches_scroll.viewport_h > 0.0 {
+                    ((self.matches_scroll.viewport_h / ROW_HEIGHT).floor() as usize)
+                        .saturating_sub(1)
+                        .max(1)
+                } else {
+                    10
+                };
+                let next_row = match key {
+                    ScrollKey::Down => (cur_row + 1).min(row_count - 1),
+                    ScrollKey::Up => cur_row.saturating_sub(1),
+                    ScrollKey::PageDown => (cur_row + page_rows).min(row_count - 1),
+                    ScrollKey::PageUp => cur_row.saturating_sub(page_rows),
+                    ScrollKey::Home => 0,
+                    ScrollKey::End => row_count - 1,
+                };
+                self.selected_hit_idx = Some(self.filtered_hit_indices[next_row]);
+                scroll_to_row = Some(next_row);
+            } else {
+                scroll_offset = Some(next_scroll_offset(self.matches_scroll, ROW_HEIGHT, key));
+            }
+        }
+
+        let mut builder = TableBuilder::new(ui)
+            .id_salt("matches_table")
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -1264,10 +1362,16 @@ impl HlaPrimerApp {
             .column(Column::initial(65.0).at_least(50.0)) // Start
             .column(Column::initial(65.0).at_least(50.0)) // End
             .column(Column::initial(70.0).at_least(55.0)) // Length
-            .column(Column::initial(65.0).at_least(50.0)) // Fwd MM
-            .column(Column::initial(65.0).at_least(50.0)) // Rev MM
-            .column(Column::initial(70.0).at_least(55.0)) // Total MM
-            .column(Column::remainder().at_least(140.0)) // Binding sites preview
+            .column(Column::initial(75.0).at_least(55.0)) // Total MM
+            .column(Column::remainder().at_least(180.0)); // Binding sites preview
+
+        if let Some(row) = scroll_to_row {
+            builder = builder.scroll_to_row(row, None);
+        } else if let Some(offset) = scroll_offset {
+            builder = builder.vertical_scroll_offset(offset);
+        }
+
+        let scroll_out = builder
             .header(22.0, |mut header| {
                 let cols = [
                     ("Allele", HitSortCol::Allele, None),
@@ -1282,8 +1386,6 @@ impl HlaPrimerApp {
                         Some("0-based exclusive end coordinate"),
                     ),
                     ("Length", HitSortCol::Length, Some("Amplicon length in bp")),
-                    ("Fwd MM", HitSortCol::FwdMm, None),
-                    ("Rev MM", HitSortCol::RevMm, None),
                     ("Total MM", HitSortCol::TotalMm, None),
                 ];
                 for (title, col, tip) in cols {
@@ -1303,12 +1405,16 @@ impl HlaPrimerApp {
                     });
                 }
                 header.col(|ui| {
-                    ui.label(RichText::new("Fwd / Rev Template Sites").strong());
+                    ui.label(RichText::new("Fwd / Rev Template Sites").strong())
+                        .on_hover_text(
+                            "Mismatched base background color by per-site mismatch count:\n\
+                             Green = 1 mismatch • Yellow = 2 mismatches • Red = 3+ mismatches",
+                        );
                 });
             })
             .body(|body| {
                 let row_count = self.filtered_hit_indices.len();
-                body.rows(20.0, row_count, |mut row| {
+                body.rows(ROW_HEIGHT, row_count, |mut row| {
                     let row_i = row.index();
                     let hit_idx = self.filtered_hit_indices[row_i];
                     let hit = &res.hits[hit_idx];
@@ -1328,16 +1434,10 @@ impl HlaPrimerApp {
                         ui.label(hit.length.to_string());
                     });
                     row.col(|ui| {
-                        mm_badge(ui, hit.fwd_mismatches, colors);
-                    });
-                    row.col(|ui| {
-                        mm_badge(ui, hit.rev_mismatches, colors);
-                    });
-                    row.col(|ui| {
                         mm_badge(ui, hit.fwd_mismatches + hit.rev_mismatches, colors);
                     });
                     row.col(|ui| {
-                        ui.monospace(format!("{} … {}", hit.fwd_template, hit.rev_template));
+                        render_template_sites_cell(ui, hit, &fwd_masks, &rev_masks, colors);
                     });
 
                     if row.response().clicked() {
@@ -1345,6 +1445,12 @@ impl HlaPrimerApp {
                     }
                 });
             });
+
+        self.matches_scroll = TableScrollState {
+            offset_y: scroll_out.state.offset.y,
+            viewport_h: scroll_out.inner_rect.height(),
+            content_h: scroll_out.content_size.y,
+        };
 
         if let Some(col) = sort_change {
             if self.hit_sort_col == col {
@@ -1360,12 +1466,17 @@ impl HlaPrimerApp {
         }
     }
 
-    fn render_coverage_table(&self, ui: &mut egui::Ui) {
+    fn render_coverage_table(&mut self, ui: &mut egui::Ui) {
         let Some(ref res) = self.results else {
             return;
         };
 
-        TableBuilder::new(ui)
+        const ROW_HEIGHT: f32 = 22.0;
+        let scroll_offset = read_scroll_key(ui.ctx())
+            .map(|key| next_scroll_offset(self.coverage_scroll, ROW_HEIGHT, key));
+
+        let mut builder = TableBuilder::new(ui)
+            .id_salt("coverage_table")
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -1373,7 +1484,13 @@ impl HlaPrimerApp {
             .column(Column::initial(85.0))
             .column(Column::initial(85.0))
             .column(Column::initial(85.0))
-            .column(Column::remainder().at_least(180.0))
+            .column(Column::remainder().at_least(180.0));
+
+        if let Some(offset) = scroll_offset {
+            builder = builder.vertical_scroll_offset(offset);
+        }
+
+        let scroll_out = builder
             .header(22.0, |mut header| {
                 for title in ["Locus", "Matched", "Missed", "Total", "Coverage"] {
                     header.col(|ui| {
@@ -1383,7 +1500,7 @@ impl HlaPrimerApp {
             })
             .body(|body| {
                 let count = self.filtered_coverage_indices.len();
-                body.rows(22.0, count, |mut row| {
+                body.rows(ROW_HEIGHT, count, |mut row| {
                     let c = &res.locus_coverage[self.filtered_coverage_indices[row.index()]];
                     row.col(|ui| {
                         ui.monospace(&c.locus);
@@ -1405,6 +1522,12 @@ impl HlaPrimerApp {
                     });
                 });
             });
+
+        self.coverage_scroll = TableScrollState {
+            offset_y: scroll_out.state.offset.y,
+            viewport_h: scroll_out.inner_rect.height(),
+            content_h: scroll_out.content_size.y,
+        };
     }
 
     fn render_missed_table(&mut self, ui: &mut egui::Ui) {
@@ -1417,9 +1540,14 @@ impl HlaPrimerApp {
             return;
         }
 
+        const ROW_HEIGHT: f32 = 20.0;
+        let scroll_offset = read_scroll_key(ui.ctx())
+            .map(|key| next_scroll_offset(self.missed_scroll, ROW_HEIGHT, key));
+
         let mut sort_change: Option<MissSortCol> = None;
 
-        TableBuilder::new(ui)
+        let mut builder = TableBuilder::new(ui)
+            .id_salt("missed_table")
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -1427,7 +1555,13 @@ impl HlaPrimerApp {
             .column(Column::initial(80.0))
             .column(Column::remainder().at_least(220.0))
             .column(Column::initial(80.0))
-            .column(Column::initial(80.0))
+            .column(Column::initial(80.0));
+
+        if let Some(offset) = scroll_offset {
+            builder = builder.vertical_scroll_offset(offset);
+        }
+
+        let scroll_out = builder
             .header(22.0, |mut header| {
                 let cols = [
                     ("Allele", MissSortCol::Allele),
@@ -1454,7 +1588,7 @@ impl HlaPrimerApp {
             })
             .body(|body| {
                 let count = self.filtered_miss_indices.len();
-                body.rows(20.0, count, |mut row| {
+                body.rows(ROW_HEIGHT, count, |mut row| {
                     let m = &res.missed[self.filtered_miss_indices[row.index()]];
                     row.col(|ui| {
                         ui.monospace(&m.allele);
@@ -1473,6 +1607,12 @@ impl HlaPrimerApp {
                     });
                 });
             });
+
+        self.missed_scroll = TableScrollState {
+            offset_y: scroll_out.state.offset.y,
+            viewport_h: scroll_out.inner_rect.height(),
+            content_h: scroll_out.content_size.y,
+        };
 
         if let Some(col) = sort_change {
             if self.miss_sort_col == col {
@@ -1527,49 +1667,55 @@ impl HlaPrimerApp {
         });
 
         ui.add_space(4.0);
-        egui::ScrollArea::both().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Forward alignment block
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "Forward Primer (5'→3') • {} mismatch(es) • green = 3' end identity",
-                            hit.fwd_mismatches
-                        ))
-                        .small(),
-                    );
-                    render_colored_alignment(
-                        ui,
-                        &res.fwd_primer_used,
-                        &hit.fwd_template,
-                        res.end_identity_used,
-                        true,
-                        colors,
-                    );
-                });
+        egui::ScrollArea::horizontal()
+            .id_salt("alignment_inspector_scroll")
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        // Forward alignment block
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Forward Primer (5'→3') • {} mismatch(es) • green = 3' end identity",
+                                    hit.fwd_mismatches
+                                ))
+                                .small(),
+                            );
+                            render_colored_alignment(
+                                ui,
+                                &res.fwd_primer_used,
+                                &hit.fwd_template,
+                                res.end_identity_used,
+                                true,
+                                colors,
+                            );
+                        });
 
-                ui.add_space(8.0);
+                        ui.add_space(8.0);
 
-                // Reverse alignment block (sense strand orientation)
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "Reverse Motif (sense +) • {} mismatch(es) • green = rev 3' end identity",
-                            hit.rev_mismatches
-                        ))
-                        .small(),
-                    );
-                    render_colored_alignment(
-                        ui,
-                        &res.rev_motif_used,
-                        &hit.rev_template,
-                        res.end_identity_used,
-                        false,
-                        colors,
-                    );
+                        // Reverse alignment block (sense strand orientation)
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Reverse Motif (sense +) • {} mismatch(es) • green = rev 3' end identity",
+                                    hit.rev_mismatches
+                                ))
+                                .small(),
+                            );
+                            render_colored_alignment(
+                                ui,
+                                &res.rev_motif_used,
+                                &hit.rev_template,
+                                res.end_identity_used,
+                                false,
+                                colors,
+                            );
+                        });
+                    });
+                    // Keep space below alignment frames so the horizontal scrollbar never overlaps text.
+                    ui.add_space(18.0);
                 });
             });
-        });
 
         if let Some(seq) = copy_seq {
             ui.ctx().copy_text(seq);
@@ -1708,6 +1854,105 @@ fn mm_badge(ui: &mut egui::Ui, mm: usize, colors: &ThemeColors) {
     ui.colored_label(color, RichText::new(mm.to_string()).strong());
 }
 
+fn append_highlighted_site(
+    job: &mut egui::text::LayoutJob,
+    template: &str,
+    primer_masks: &[u8],
+    site_mismatches: usize,
+    font: &egui::FontId,
+    normal_color: Color32,
+    colors: &ThemeColors,
+) {
+    let normal_fmt = egui::TextFormat::simple(font.clone(), normal_color);
+    if site_mismatches == 0 || primer_masks.is_empty() {
+        job.append(template, 0.0, normal_fmt);
+        return;
+    }
+
+    let (mm_bg, mm_fg) = match site_mismatches {
+        1 => colors.site_mm1,
+        2 => colors.site_mm2,
+        _ => colors.site_mm3_plus,
+    };
+    let mm_fmt = egui::TextFormat {
+        font_id: font.clone(),
+        color: mm_fg,
+        background: mm_bg,
+        ..Default::default()
+    };
+
+    let mut run_start = 0usize;
+    let mut run_is_mm: Option<bool> = None;
+
+    for (pos, (byte_idx, ch)) in template.char_indices().enumerate() {
+        let is_mm = if pos < primer_masks.len() {
+            !(ch.is_ascii() && bases_match(ch as u8, primer_masks[pos]))
+        } else {
+            false
+        };
+
+        match run_is_mm {
+            None => run_is_mm = Some(is_mm),
+            Some(prev) if prev != is_mm => {
+                let fmt = if prev {
+                    mm_fmt.clone()
+                } else {
+                    normal_fmt.clone()
+                };
+                job.append(&template[run_start..byte_idx], 0.0, fmt);
+                run_start = byte_idx;
+                run_is_mm = Some(is_mm);
+            }
+            Some(_) => {}
+        }
+    }
+
+    if let Some(prev) = run_is_mm
+        && run_start < template.len()
+    {
+        let fmt = if prev { mm_fmt } else { normal_fmt };
+        job.append(&template[run_start..], 0.0, fmt);
+    }
+}
+
+fn render_template_sites_cell(
+    ui: &mut egui::Ui,
+    hit: &AmpliconHit,
+    fwd_masks: &[u8],
+    rev_masks: &[u8],
+    colors: &ThemeColors,
+) {
+    let font = TextStyle::Monospace.resolve(ui.style());
+    let normal_color = ui.visuals().text_color();
+    let mut job = egui::text::LayoutJob::default();
+
+    append_highlighted_site(
+        &mut job,
+        &hit.fwd_template,
+        fwd_masks,
+        hit.fwd_mismatches,
+        &font,
+        normal_color,
+        colors,
+    );
+    job.append(
+        " … ",
+        0.0,
+        egui::TextFormat::simple(font.clone(), colors.muted),
+    );
+    append_highlighted_site(
+        &mut job,
+        &hit.rev_template,
+        rev_masks,
+        hit.rev_mismatches,
+        &font,
+        normal_color,
+        colors,
+    );
+
+    ui.label(job);
+}
+
 fn render_colored_alignment(
     ui: &mut egui::Ui,
     primer: &str,
@@ -1777,6 +2022,44 @@ fn render_colored_alignment(
     ui.label(primer_job);
     ui.label(mid_job);
     ui.label(tmpl_job);
+}
+
+fn read_scroll_key(ctx: &egui::Context) -> Option<ScrollKey> {
+    if ctx.wants_keyboard_input() {
+        return None;
+    }
+    ctx.input(|i| {
+        if i.key_pressed(egui::Key::ArrowDown) {
+            Some(ScrollKey::Down)
+        } else if i.key_pressed(egui::Key::ArrowUp) {
+            Some(ScrollKey::Up)
+        } else if i.key_pressed(egui::Key::PageDown) {
+            Some(ScrollKey::PageDown)
+        } else if i.key_pressed(egui::Key::PageUp) {
+            Some(ScrollKey::PageUp)
+        } else if i.key_pressed(egui::Key::Home) {
+            Some(ScrollKey::Home)
+        } else if i.key_pressed(egui::Key::End) {
+            Some(ScrollKey::End)
+        } else {
+            None
+        }
+    })
+}
+
+fn next_scroll_offset(state: TableScrollState, row_height: f32, key: ScrollKey) -> f32 {
+    let max_offset = (state.content_h - state.viewport_h).max(0.0);
+    let step = row_height * 3.0;
+    let page = (state.viewport_h - row_height).max(row_height);
+    let target = match key {
+        ScrollKey::Down => state.offset_y + step,
+        ScrollKey::Up => state.offset_y - step,
+        ScrollKey::PageDown => state.offset_y + page,
+        ScrollKey::PageUp => state.offset_y - page,
+        ScrollKey::Home => 0.0,
+        ScrollKey::End => max_offset,
+    };
+    target.clamp(0.0, max_offset)
 }
 
 fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {

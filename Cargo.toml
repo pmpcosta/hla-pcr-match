@@ -1,6 +1,6 @@
 [package]
 name = "hla-pcr-match"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Standalone GUI tool for in-silico HLA PCR primer matching modeled after IPD-MHC Primer Match"
 license = "Apache-2.0"
